@@ -50,6 +50,7 @@ class Node:
     max_level: float = 10.0
     init_level: float = 5.0
     building_type: str = "multi"
+    dma_zone: str = ""
 
     def get_demand_at_hour(self, hour: int) -> float:
         if self.node_type == NodeType.SOURCE:
