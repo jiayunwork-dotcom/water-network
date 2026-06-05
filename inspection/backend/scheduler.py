@@ -1,5 +1,6 @@
 import numpy as np
-from models import db, Inspector, Task
+from datetime import datetime
+from models import db, Inspector, Task, Certificate
 
 
 SKILL_HIERARCHY = {
@@ -38,6 +39,12 @@ def _inspector_can_handle(inspector, task):
     if task.area:
         inspector_areas = inspector.areas.split(",") if inspector.areas else []
         if task.area not in inspector_areas:
+            return False
+    certs = Certificate.query.filter_by(inspector_id=inspector.id).all()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    has_expired = any(c.valid_until < today_str for c in certs)
+    if has_expired:
+        if SKILL_HIERARCHY.get(inspector.skill_level, 0) < SKILL_HIERARCHY.get(required_skill, 0) + 1:
             return False
     return True
 

@@ -97,6 +97,12 @@ ANOMALY_STATUS_MAP = {
     "accepted": "已验收",
 }
 
+ALERT_LEVEL_MAP = {"info": "提示", "warning": "警告", "critical": "严重"}
+ALERT_LEVEL_REV = {"提示": "info", "警告": "warning", "严重": "critical"}
+ALERT_STATUS_MAP = {"unread": "未读", "read": "已读"}
+CERT_STATUS_MAP = {"valid": "有效", "expired": "已过期", "expiring_soon": "即将过期"}
+TRAINING_RESULT_MAP = {"pass": "合格", "fail": "不合格"}
+
 
 def page_inspectors():
     st.header("👷 巡检员管理")
@@ -762,13 +768,587 @@ def page_dashboard():
         st.info("暂无绩效数据")
 
 
+def page_trajectory():
+    st.header("🗺️ 巡检轨迹回放与偏差检测")
+
+    tasks = api_get("/api/tasks") or []
+    completed_tasks = [t for t in tasks if t["status"] in ["completed", "anomaly", "in_progress"]]
+    if not completed_tasks:
+        st.info("暂无可查看轨迹的任务")
+        return
+
+    task_options = {
+        f"#{t['id']} {TASK_TYPE_MAP.get(t['task_type'], '')} - {TASK_STATUS_MAP.get(t['status'], '')}": t["id"]
+        for t in completed_tasks
+    }
+    sel_task_key = st.selectbox("选择任务", list(task_options.keys()), key="traj_task_sel")
+    sel_task_id = task_options[sel_task_key]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("加载轨迹数据", key="load_traj_btn"):
+            st.session_state["traj_task_id"] = sel_task_id
+    with col2:
+        if st.button("上报模拟轨迹点", key="simulate_traj_btn"):
+            import random
+            lat_base, lon_base = 30.0, 120.0
+            for i in range(10):
+                lat = lat_base + random.uniform(-0.01, 0.01)
+                lon = lon_base + random.uniform(-0.01, 0.01)
+                ts = datetime.now().isoformat()
+                api_post("/api/trajectories", {
+                    "task_id": sel_task_id,
+                    "gps_lat": lat,
+                    "gps_lon": lon,
+                    "timestamp": ts,
+                })
+            st.success("已模拟上报10个轨迹点")
+            st.session_state["traj_task_id"] = sel_task_id
+
+    if "traj_task_id" not in st.session_state or st.session_state["traj_task_id"] != sel_task_id:
+        return
+
+    trajectory = api_get("/api/trajectories", params={"task_id": sel_task_id}) or []
+    if not trajectory:
+        st.warning("该任务暂无轨迹数据，请先上报轨迹点")
+        return
+
+    deviation = api_get(f"/api/trajectories/{sel_task_id}/deviation")
+    planned = api_get(f"/api/trajectories/planned-route/{sel_task_id}")
+
+    st.subheader("轨迹偏差分析")
+    if deviation:
+        col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+        col_d1.metric("总轨迹点数", deviation.get("total_points", 0))
+        col_d2.metric("偏离点数", deviation.get("deviation_points", 0))
+        col_d3.metric("偏离率", f"{deviation.get('deviation_rate', 0)}%")
+        col_d4.metric("路线异常", "⚠️ 是" if deviation.get("route_anomaly") else "✅ 否")
+        if deviation.get("route_anomaly"):
+            st.error("⚠️ 偏离率超过20%，该任务标记为路线异常")
+
+    st.subheader("轨迹可视化")
+    fig = go.Figure()
+
+    if planned and planned.get("coords"):
+        planned_lats = [c["x"] for c in planned["coords"]]
+        planned_lons = [c["y"] for c in planned["coords"]]
+        fig.add_trace(go.Scatter(
+            x=planned_lons, y=planned_lats,
+            mode="lines+markers",
+            name="规划路线",
+            line=dict(color="blue", width=3),
+            marker=dict(symbol="square", size=10),
+        ))
+
+    actual_lats = [p["gps_lat"] for p in trajectory]
+    actual_lons = [p["gps_lon"] for p in trajectory]
+    fig.add_trace(go.Scatter(
+        x=actual_lons, y=actual_lats,
+        mode="lines+markers",
+        name="实际轨迹",
+        line=dict(color="green", width=2),
+        marker=dict(size=6),
+    ))
+
+    if deviation and deviation.get("points_detail"):
+        dev_points = [p for p in deviation["points_detail"] if p.get("is_deviation")]
+        if dev_points:
+            fig.add_trace(go.Scatter(
+                x=[p["gps_lon"] for p in dev_points],
+                y=[p["gps_lat"] for p in dev_points],
+                mode="markers",
+                name="偏离点",
+                marker=dict(color="red", size=12, symbol="x"),
+            ))
+
+    fig.update_layout(
+        title="巡检轨迹回放 (蓝=规划路线, 绿=实际轨迹, 红=偏离点)",
+        xaxis_title="Y坐标/经度",
+        yaxis_title="X坐标/纬度",
+        height=500,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if deviation and deviation.get("points_detail"):
+        st.subheader("偏差详情")
+        detail_rows = []
+        for p in deviation["points_detail"]:
+            detail_rows.append({
+                "轨迹点ID": p["id"],
+                "纬度": p["gps_lat"],
+                "经度": p["gps_lon"],
+                "时间": p.get("timestamp", "")[:19] if p.get("timestamp") else "",
+                "距规划路线(m)": p.get("distance_to_route", 0),
+                "是否偏离": "🔴 是" if p.get("is_deviation") else "否",
+            })
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+
+def page_report():
+    st.header("📄 巡检报告自动生成")
+
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        start_date = st.date_input("开始日期", value=datetime.now().replace(day=1), key="report_start")
+    with col_d2:
+        end_date = st.date_input("结束日期", value=datetime.now(), key="report_end")
+
+    if st.button("生成报告", type="primary", key="gen_report_btn"):
+        with st.spinner("正在生成报告..."):
+            report = api_get("/api/reports/generate", params={
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+            })
+
+        if not report:
+            st.error("报告生成失败，请确认后端服务已启动")
+            return
+
+        st.session_state["report_data"] = report
+
+    if "report_data" not in st.session_state:
+        return
+
+    report = st.session_state["report_data"]
+
+    st.subheader("1. 巡检概况")
+    overview = report.get("overview", {})
+    col_o1, col_o2, col_o3, col_o4 = st.columns(4)
+    col_o1.metric("总任务数", overview.get("total_tasks", 0))
+    col_o2.metric("完成数", overview.get("completed_tasks", 0))
+    col_o3.metric("异常数", overview.get("anomaly_tasks", 0))
+    col_o4.metric("完成率", f"{overview.get('completion_rate', 0)}%")
+
+    if overview.get("total_tasks", 0) > 0:
+        fig_ov = px.pie(
+            values=[
+                overview.get("completed_tasks", 0),
+                overview.get("anomaly_tasks", 0),
+                max(0, overview.get("total_tasks", 0) - overview.get("completed_tasks", 0) - overview.get("anomaly_tasks", 0)),
+            ],
+            names=["已完成", "异常", "其他"],
+            title="任务完成概况",
+            color=["已完成", "异常", "其他"],
+            color_discrete_map={"已完成": "#4CAF50", "异常": "#F44336", "其他": "#FF9800"},
+        )
+        st.plotly_chart(fig_ov, use_container_width=True)
+
+    st.subheader("2. 巡检员工作量明细")
+    workload = report.get("inspector_workload", [])
+    if workload:
+        df_wl = pd.DataFrame(workload)
+        df_wl_display = df_wl.rename(columns={
+            "inspector_name": "姓名",
+            "completed_tasks": "完成任务数",
+            "found_anomalies": "发现异常数",
+            "total_inspection_minutes": "总巡检时长(分钟)",
+            "avg_minutes_per_task": "平均每任务耗时(分钟)",
+        })
+        st.dataframe(df_wl_display[["姓名", "完成任务数", "发现异常数", "总巡检时长(分钟)", "平均每任务耗时(分钟)"]],
+                     use_container_width=True, hide_index=True)
+
+        fig_wl = px.bar(
+            df_wl, x="inspector_name", y=["completed_tasks", "found_anomalies"],
+            title="各巡检员工作量对比",
+            barmode="group",
+            labels={"inspector_name": "巡检员", "value": "数量"},
+        )
+        st.plotly_chart(fig_wl, use_container_width=True)
+    else:
+        st.info("暂无工作量数据")
+
+    st.subheader("3. 异常统计")
+    anomaly_stats = report.get("anomaly_stats", {})
+
+    col_as1, col_as2, col_as3 = st.columns(3)
+    with col_as1:
+        by_type = anomaly_stats.get("by_type", {})
+        if by_type:
+            df_type = pd.DataFrame([{"异常类型": ANOMALY_TYPE_MAP.get(k, k), "数量": v} for k, v in by_type.items()])
+            fig_type = px.pie(df_type, values="数量", names="异常类型", title="按类型分组")
+            st.plotly_chart(fig_type, use_container_width=True)
+        else:
+            st.info("按类型: 暂无数据")
+
+    with col_as2:
+        by_severity = anomaly_stats.get("by_severity", {})
+        if by_severity:
+            df_sev = pd.DataFrame([{"严重程度": SEVERITY_MAP.get(k, k), "数量": v} for k, v in by_severity.items()])
+            fig_sev = px.pie(df_sev, values="数量", names="严重程度", title="按严重程度分组")
+            st.plotly_chart(fig_sev, use_container_width=True)
+        else:
+            st.info("按严重程度: 暂无数据")
+
+    with col_as3:
+        by_area = anomaly_stats.get("by_area", {})
+        if by_area:
+            df_area = pd.DataFrame([{"片区": k, "数量": v} for k, v in by_area.items()])
+            fig_area = px.pie(df_area, values="数量", names="片区", title="按片区分组")
+            st.plotly_chart(fig_area, use_container_width=True)
+        else:
+            st.info("按片区: 暂无数据")
+
+    st.subheader("4. 轨迹合规分析")
+    compliance = report.get("trajectory_compliance", [])
+    route_anomaly = report.get("route_anomaly_tasks", [])
+    if compliance:
+        df_comp = pd.DataFrame(compliance)
+        df_comp_display = df_comp.rename(columns={
+            "task_id": "任务ID",
+            "task_type": "任务类型",
+            "inspector_name": "巡检员",
+            "deviation_rate": "偏离率(%)",
+            "route_anomaly": "路线异常",
+        })
+        df_comp_display["任务类型"] = df_comp_display["任务类型"].map(lambda x: TASK_TYPE_MAP.get(x, x))
+        df_comp_display["路线异常"] = df_comp_display["路线异常"].map(lambda x: "⚠️ 是" if x else "否")
+        st.dataframe(df_comp_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("暂无轨迹合规数据")
+
+    if route_anomaly:
+        st.subheader("⚠️ 路线异常任务列表")
+        for ra in route_anomaly:
+            st.error(
+                f"任务 #{ra['task_id']} ({TASK_TYPE_MAP.get(ra['task_type'], '')}) - "
+                f"巡检员: {ra.get('inspector_name', '未知')} - 偏离率: {ra.get('deviation_rate', 0)}%"
+            )
+
+    st.subheader("导出PDF")
+    if st.button("📄 导出报告为PDF", key="export_pdf_btn"):
+        try:
+            from fpdf import FPDF
+
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Helvetica", size=12)
+            pdf.cell(200, 10, txt="Inspection Report", ln=True, align="C")
+            pdf.ln(5)
+
+            ov = report.get("overview", {})
+            pdf.cell(200, 10, txt=f"Period: {ov.get('start_date', '')} ~ {ov.get('end_date', '')}", ln=True)
+            pdf.cell(200, 10, txt=f"Total Tasks: {ov.get('total_tasks', 0)}", ln=True)
+            pdf.cell(200, 10, txt=f"Completed: {ov.get('completed_tasks', 0)}", ln=True)
+            pdf.cell(200, 10, txt=f"Anomaly: {ov.get('anomaly_tasks', 0)}", ln=True)
+            pdf.cell(200, 10, txt=f"Completion Rate: {ov.get('completion_rate', 0)}%", ln=True)
+            pdf.ln(5)
+
+            wl = report.get("inspector_workload", [])
+            if wl:
+                pdf.cell(200, 10, txt="Inspector Workload:", ln=True)
+                for w in wl:
+                    line = f"  {w.get('inspector_name', '')}: Completed={w.get('completed_tasks', 0)}, Anomalies={w.get('found_anomalies', 0)}, Minutes={w.get('total_inspection_minutes', 0)}"
+                    pdf.cell(200, 8, txt=line, ln=True)
+
+            comp = report.get("trajectory_compliance", [])
+            if comp:
+                pdf.ln(3)
+                pdf.cell(200, 10, txt="Trajectory Compliance:", ln=True)
+                for c in comp:
+                    line = f"  Task#{c['task_id']}: DevRate={c.get('deviation_rate', 0)}%, Anomaly={'Yes' if c.get('route_anomaly') else 'No'}"
+                    pdf.cell(200, 8, txt=line, ln=True)
+
+            pdf_output = pdf.output(dest="S")
+            st.download_button(
+                label="下载PDF文件",
+                data=bytes(pdf_output),
+                file_name=f"inspection_report_{start_date}_{end_date}.pdf",
+                mime="application/pdf",
+            )
+        except ImportError:
+            st.warning("PDF导出需要安装fpdf2库，正在尝试安装...")
+            import subprocess
+            subprocess.run(["pip", "install", "fpdf2"], capture_output=True)
+            st.info("已安装fpdf2，请再次点击导出按钮")
+
+
+def page_alerts():
+    st.header("🔔 告警与消息推送")
+
+    tab_rules, tab_records = st.tabs(["告警规则配置", "告警记录"])
+
+    with tab_rules:
+        st.subheader("已有告警规则")
+        rules = api_get("/api/alert-rules") or []
+        if rules:
+            rule_rows = []
+            for r in rules:
+                cond = r.get("condition_json", {}) if isinstance(r.get("condition_json"), dict) else {}
+                rule_rows.append({
+                    "ID": r["id"],
+                    "规则名称": r["name"],
+                    "触发条件类型": cond.get("type", ""),
+                    "告警级别": ALERT_LEVEL_MAP.get(r["level"], r["level"]),
+                    "通知方式": r.get("notify_method", ""),
+                    "启用": "✅" if r.get("enabled") else "❌",
+                })
+            st.dataframe(pd.DataFrame(rule_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无告警规则")
+
+        st.subheader("添加告警规则")
+        with st.form("add_alert_rule_form"):
+            ar_name = st.text_input("规则名称")
+            ar_type = st.selectbox("触发条件类型", [
+                "area_consecutive_anomaly",
+                "inspector_overtime",
+                "urgent_unhandled",
+            ])
+            ar_params_col1, ar_params_col2 = st.columns(2)
+            with ar_params_col1:
+                if ar_type == "area_consecutive_anomaly":
+                    ar_area = st.text_input("片区", value="DMA-1")
+                    ar_days = st.number_input("连续天数", min_value=1, value=3)
+                elif ar_type == "inspector_overtime":
+                    ar_hours = st.number_input("工作时长上限(小时)", min_value=1, value=10)
+                elif ar_type == "urgent_unhandled":
+                    ar_urgent_hours = st.number_input("未处理时长上限(小时)", min_value=1, value=2)
+            with ar_params_col2:
+                if ar_type == "area_consecutive_anomaly":
+                    ar_threshold = st.number_input("异常数阈值", min_value=1, value=5)
+
+            ar_level = st.selectbox("告警级别", ["提示", "警告", "严重"])
+            ar_enabled = st.checkbox("启用规则", value=True)
+
+            submitted = st.form_submit_button("添加规则")
+            if submitted:
+                if not ar_name:
+                    st.error("规则名称为必填项")
+                else:
+                    cond = {"type": ar_type}
+                    if ar_type == "area_consecutive_anomaly":
+                        cond["area"] = ar_area
+                        cond["days"] = ar_days
+                        cond["threshold"] = ar_threshold
+                    elif ar_type == "inspector_overtime":
+                        cond["hours"] = ar_hours
+                    elif ar_type == "urgent_unhandled":
+                        cond["hours"] = ar_urgent_hours
+
+                    code, resp = api_post("/api/alert-rules", {
+                        "name": ar_name,
+                        "condition_json": cond,
+                        "level": ALERT_LEVEL_REV[ar_level],
+                        "notify_method": "site_message",
+                        "enabled": ar_enabled,
+                    })
+                    if code == 201:
+                        st.success("告警规则添加成功")
+                        st.rerun()
+                    else:
+                        st.error(resp.get("error", "添加失败"))
+
+        if rules:
+            st.subheader("删除告警规则")
+            del_rule_id = st.selectbox("选择规则ID", [r["id"] for r in rules], key="del_rule_sel")
+            if st.button("删除选中规则", key="del_rule_btn"):
+                code, resp = api_delete(f"/api/alert-rules/{del_rule_id}")
+                if code == 200:
+                    st.success("删除成功")
+                    st.rerun()
+                else:
+                    st.error(resp.get("error", "删除失败"))
+
+        st.divider()
+        st.subheader("执行告警检查")
+        if st.button("🔍 手动执行告警检查", type="primary", key="check_alerts_btn"):
+            with st.spinner("正在检查告警规则..."):
+                code, resp = api_post("/api/alerts/check")
+            if code == 200:
+                count = resp.get("generated_count", 0)
+                if count > 0:
+                    st.warning(f"触发了 {count} 条告警！")
+                    for a in resp.get("alerts", []):
+                        level_emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(a.get("level", ""), "ℹ️")
+                        st.error(f"{level_emoji} [{ALERT_LEVEL_MAP.get(a.get('level', ''), '')}] {a.get('content', '')}")
+                else:
+                    st.success("✅ 当前无告警触发")
+            else:
+                st.error("告警检查执行失败")
+
+    with tab_records:
+        st.subheader("告警记录")
+        col_af1, col_af2 = st.columns(2)
+        with col_af1:
+            filter_status = st.selectbox("状态筛选", ["全部", "未读", "已读"], key="alert_filter_status")
+        with col_af2:
+            filter_level = st.selectbox("级别筛选", ["全部", "提示", "警告", "严重"], key="alert_filter_level")
+
+        params = {}
+        if filter_status != "全部":
+            params["status"] = "unread" if filter_status == "未读" else "read"
+        if filter_level != "全部":
+            params["level"] = ALERT_LEVEL_REV[filter_level]
+
+        records = api_get("/api/alerts/records", params=params) or []
+        if records:
+            rec_rows = []
+            for r in records:
+                level_emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(r.get("level", ""), "ℹ️")
+                rec_rows.append({
+                    "ID": r["id"],
+                    "告警时间": r.get("alert_time", "")[:19] if r.get("alert_time") else "",
+                    "规则名称": r.get("rule_name", ""),
+                    "告警内容": r.get("content", ""),
+                    "级别": f"{level_emoji} {ALERT_LEVEL_MAP.get(r.get('level', ''), '')}",
+                    "状态": ALERT_STATUS_MAP.get(r.get("status", ""), ""),
+                })
+            st.dataframe(pd.DataFrame(rec_rows), use_container_width=True, hide_index=True)
+
+            unread_records = [r for r in records if r.get("status") == "unread"]
+            if unread_records:
+                st.subheader("确认已读")
+                sel_rec = st.selectbox(
+                    "选择告警记录",
+                    [f"#{r['id']} {r.get('content', '')[:30]}" for r in unread_records],
+                    key="mark_read_sel",
+                )
+                sel_rec_id = unread_records[[f"#{r['id']} {r.get('content', '')[:30]}" for r in unread_records].index(sel_rec)]["id"]
+                if st.button("确认已读", key="mark_read_btn"):
+                    code, resp = api_put(f"/api/alerts/records/{sel_rec_id}/read")
+                    if code == 200:
+                        st.success("已标记为已读")
+                        st.rerun()
+                    else:
+                        st.error(resp.get("error", "操作失败"))
+        else:
+            st.info("暂无告警记录")
+
+
+def page_certifications():
+    st.header("🎓 巡检员技能认证与培训记录")
+
+    inspectors = api_get("/api/inspectors") or []
+    if not inspectors:
+        st.info("暂无巡检员数据")
+        return
+
+    insp_options = {f"{i['employee_id']} - {i['name']} ({SKILL_MAP.get(i['skill_level'], '')})": i["id"] for i in inspectors}
+    sel_insp_key = st.selectbox("选择巡检员", list(insp_options.keys()), key="cert_insp_sel")
+    sel_insp_id = insp_options[sel_insp_key]
+
+    cert_status = api_get(f"/api/inspectors/{sel_insp_id}/cert-status")
+    certs = api_get("/api/certificates", params={"inspector_id": sel_insp_id}) or []
+    trainings = api_get("/api/training-records", params={"inspector_id": sel_insp_id}) or []
+
+    st.subheader("证书信息")
+    if cert_status and cert_status.get("certificates"):
+        cert_rows = []
+        for c in cert_status["certificates"]:
+            status = c.get("status", "valid")
+            status_label = CERT_STATUS_MAP.get(status, status)
+            if status == "expired":
+                status_display = f"🔴 {status_label}"
+            elif status == "expiring_soon":
+                status_display = f"🟡 {status_label}"
+            else:
+                status_display = f"🟢 {status_label}"
+            cert_rows.append({
+                "证书ID": c["id"],
+                "证书名称": c["cert_name"],
+                "发证机构": c.get("issuer", ""),
+                "有效期至": c["valid_until"],
+                "状态": status_display,
+            })
+        st.dataframe(pd.DataFrame(cert_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("该巡检员暂无证书信息")
+
+    st.subheader("添加证书")
+    with st.form("add_cert_form"):
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            cert_name = st.text_input("证书名称")
+            cert_issuer = st.text_input("发证机构")
+        with cc2:
+            cert_valid = st.date_input("有效期至", value=datetime.now())
+        submitted = st.form_submit_button("添加证书")
+        if submitted:
+            if not cert_name:
+                st.error("证书名称为必填项")
+            else:
+                code, resp = api_post("/api/certificates", {
+                    "inspector_id": sel_insp_id,
+                    "cert_name": cert_name,
+                    "issuer": cert_issuer,
+                    "valid_until": str(cert_valid),
+                })
+                if code == 201:
+                    st.success("证书添加成功")
+                    st.rerun()
+                else:
+                    st.error(resp.get("error", "添加失败"))
+
+    st.divider()
+    st.subheader("培训记录")
+    if trainings:
+        train_rows = []
+        for t in trainings:
+            result_label = TRAINING_RESULT_MAP.get(t["result"], t["result"])
+            result_display = f"✅ {result_label}" if t["result"] == "pass" else f"❌ {result_label}"
+            train_rows.append({
+                "培训ID": t["id"],
+                "培训名称": t["training_name"],
+                "培训日期": t["training_date"],
+                "时长(小时)": t["duration_hours"],
+                "考核结果": result_display,
+            })
+        st.dataframe(pd.DataFrame(train_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("该巡检员暂无培训记录")
+
+    st.subheader("添加培训记录")
+    with st.form("add_training_form"):
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            train_name = st.text_input("培训名称")
+            train_date = st.date_input("培训日期", value=datetime.now())
+        with tc2:
+            train_duration = st.number_input("时长(小时)", min_value=0.5, value=4.0, step=0.5)
+            train_result = st.selectbox("考核结果", ["合格", "不合格"])
+        submitted = st.form_submit_button("添加培训记录")
+        if submitted:
+            if not train_name:
+                st.error("培训名称为必填项")
+            else:
+                code, resp = api_post("/api/training-records", {
+                    "inspector_id": sel_insp_id,
+                    "training_name": train_name,
+                    "training_date": str(train_date),
+                    "duration_hours": train_duration,
+                    "result": "pass" if train_result == "合格" else "fail",
+                })
+                if code == 201:
+                    st.success("培训记录添加成功")
+                    st.rerun()
+                else:
+                    st.error(resp.get("error", "添加失败"))
+
+    st.divider()
+    if cert_status:
+        st.subheader("技能等级与降级状态")
+        current_level = SKILL_MAP.get(cert_status.get("skill_level", ""), "")
+        has_expired = any(c.get("status") == "expired" for c in cert_status.get("certificates", []))
+        st.markdown(f"**当前技能等级**: {current_level}")
+        if has_expired:
+            st.error("⚠️ 存在过期证书，该巡检员已自动降级！证书过期巡检员不会被分配超出当前技能等级的任务。")
+        has_expiring = any(c.get("status") == "expiring_soon" for c in cert_status.get("certificates", []))
+        if has_expiring:
+            st.warning("⚠️ 存在30天内即将过期的证书，请及时续证！")
+
+
 def main():
     st.set_page_config(page_title="管网巡检任务调度系统", layout="wide")
     st.title("🔧 管网巡检任务调度系统")
 
     page = st.sidebar.selectbox(
         "功能模块",
-        ["👷 巡检员管理", "📋 任务管理", "📅 智能排班与路线", "🚨 异常上报", "📊 统计看板"],
+        [
+            "👷 巡检员管理", "📋 任务管理", "📅 智能排班与路线",
+            "🚨 异常上报", "📊 统计看板",
+            "🗺️ 轨迹回放", "📄 巡检报告",
+            "🔔 告警管理", "🎓 认证与培训",
+        ],
     )
 
     if page == "👷 巡检员管理":
@@ -781,10 +1361,18 @@ def main():
         page_anomalies()
     elif page == "📊 统计看板":
         page_dashboard()
+    elif page == "🗺️ 轨迹回放":
+        page_trajectory()
+    elif page == "📄 巡检报告":
+        page_report()
+    elif page == "🔔 告警管理":
+        page_alerts()
+    elif page == "🎓 认证与培训":
+        page_certifications()
 
     st.sidebar.divider()
     st.sidebar.markdown(f"后端地址: `{API_BASE}`")
-    st.sidebar.markdown("管网巡检任务调度模块 v1.0")
+    st.sidebar.markdown("管网巡检任务调度模块 v2.0")
 
 
 if __name__ == "__main__":

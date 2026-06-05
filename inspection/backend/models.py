@@ -169,6 +169,138 @@ class Anomaly(db.Model):
         }
 
 
+class TrackPoint(db.Model):
+    __tablename__ = "track_points"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    task_id = db.Column(db.Integer, db.ForeignKey("tasks.id"), nullable=False)
+    gps_lat = db.Column(db.Float, nullable=False)
+    gps_lon = db.Column(db.Float, nullable=False)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    task = db.relationship("Task", backref="track_points")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "gps_lat": self.gps_lat,
+            "gps_lon": self.gps_lon,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+        }
+
+
+class AlertRule(db.Model):
+    __tablename__ = "alert_rules"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(200), nullable=False)
+    condition_json = db.Column(db.Text, nullable=False)
+    level = db.Column(db.String(20), nullable=False, default="info")
+    notify_method = db.Column(db.String(50), nullable=False, default="site_message")
+    enabled = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    LEVEL_INFO = "info"
+    LEVEL_WARNING = "warning"
+    LEVEL_CRITICAL = "critical"
+
+    def to_dict(self):
+        import json
+        return {
+            "id": self.id,
+            "name": self.name,
+            "condition_json": json.loads(self.condition_json) if self.condition_json else {},
+            "level": self.level,
+            "notify_method": self.notify_method,
+            "enabled": self.enabled,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AlertRecord(db.Model):
+    __tablename__ = "alert_records"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    rule_id = db.Column(db.Integer, db.ForeignKey("alert_rules.id"), nullable=True)
+    alert_time = db.Column(db.DateTime, default=datetime.utcnow)
+    content = db.Column(db.Text, nullable=True)
+    level = db.Column(db.String(20), nullable=False, default="info")
+    status = db.Column(db.String(20), nullable=False, default="unread")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    STATUS_UNREAD = "unread"
+    STATUS_READ = "read"
+
+    rule = db.relationship("AlertRule", backref="records")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "rule_id": self.rule_id,
+            "rule_name": self.rule.name if self.rule else None,
+            "alert_time": self.alert_time.isoformat() if self.alert_time else None,
+            "content": self.content,
+            "level": self.level,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Certificate(db.Model):
+    __tablename__ = "certificates"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    inspector_id = db.Column(db.Integer, db.ForeignKey("inspectors.id"), nullable=False)
+    cert_name = db.Column(db.String(200), nullable=False)
+    issuer = db.Column(db.String(200), nullable=False, default="")
+    valid_until = db.Column(db.String(20), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    inspector = db.relationship("Inspector", backref="certificates")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "inspector_id": self.inspector_id,
+            "cert_name": self.cert_name,
+            "issuer": self.issuer,
+            "valid_until": self.valid_until,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class TrainingRecord(db.Model):
+    __tablename__ = "training_records"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    inspector_id = db.Column(db.Integer, db.ForeignKey("inspectors.id"), nullable=False)
+    training_name = db.Column(db.String(200), nullable=False)
+    training_date = db.Column(db.String(20), nullable=False)
+    duration_hours = db.Column(db.Float, nullable=False, default=0.0)
+    result = db.Column(db.String(20), nullable=False, default="fail")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    RESULT_PASS = "pass"
+    RESULT_FAIL = "fail"
+
+    inspector = db.relationship("Inspector", backref="training_records")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "inspector_id": self.inspector_id,
+            "training_name": self.training_name,
+            "training_date": self.training_date,
+            "duration_hours": self.duration_hours,
+            "result": self.result,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class NetworkData(db.Model):
     __tablename__ = "network_data"
 

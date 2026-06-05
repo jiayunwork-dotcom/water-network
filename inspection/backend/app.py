@@ -1,4 +1,5 @@
 import json
+import math as _math
 import os
 import sys
 from datetime import datetime, timedelta
@@ -6,7 +7,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from models import db, Inspector, Task, Anomaly, NetworkData
+from models import db, Inspector, Task, Anomaly, NetworkData, TrackPoint, AlertRule, AlertRecord, Certificate, TrainingRecord
 from scheduler import daily_schedule
 from route_planner import plan_route
 
@@ -759,6 +760,566 @@ def list_network_links():
     return jsonify(result)
 
 
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371000
+    phi1, phi2 = _math.radians(lat1), _math.radians(lat2)
+    dphi = _math.radians(lat2 - lat1)
+    dlam = _math.radians(lon2 - lon1)
+    a = _math.sin(dphi / 2) ** 2 + _math.cos(phi1) * _math.cos(phi2) * _math.sin(dlam / 2) ** 2
+    return R * 2 * _math.atan2(_math.sqrt(a), _math.sqrt(1 - a))
+
+
+def _point_to_segment_distance(lat, lon, lat1, lon1, lat2, lon2):
+    dx, dy = lon2 - lon1, lat2 - lat1
+    if dx == 0 and dy == 0:
+        return _haversine(lat, lon, lat1, lon1)
+    t = max(0, min(1, ((lon - lon1) * dx + (lat - lat1) * dy) / (dx * dx + dy * dy)))
+    proj_lon = lon1 + t * dx
+    proj_lat = lat1 + t * dy
+    return _haversine(lat, lon, proj_lat, proj_lon)
+
+
+# ============================================================
+# Trajectory Tracking & Deviation Detection
+# ============================================================
+
+@app.route("/api/trajectories", methods=["POST"])
+def record_track_point():
+    data = request.get_json()
+    if not data:
+        return _error("请求体不能为空")
+    task_id = data.get("task_id")
+    gps_lat = data.get("gps_lat")
+    gps_lon = data.get("gps_lon")
+    if not task_id:
+        return _error("任务ID为必填项")
+    if gps_lat is None or gps_lon is None:
+        return _error("GPS坐标为必填项")
+    task = Task.query.get(task_id)
+    if not task:
+        return _error("任务不存在", 404)
+    ts = data.get("timestamp")
+    if ts:
+        try:
+            timestamp = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            timestamp = datetime.utcnow()
+    else:
+        timestamp = datetime.utcnow()
+    point = TrackPoint(
+        task_id=task_id,
+        gps_lat=float(gps_lat),
+        gps_lon=float(gps_lon),
+        timestamp=timestamp,
+    )
+    db.session.add(point)
+    db.session.commit()
+    return jsonify(point.to_dict()), 201
+
+
+@app.route("/api/trajectories", methods=["GET"])
+def get_trajectory():
+    task_id = request.args.get("task_id")
+    if not task_id:
+        return _error("task_id参数为必填项")
+    points = TrackPoint.query.filter_by(task_id=task_id).order_by(TrackPoint.timestamp.asc()).all()
+    return jsonify([p.to_dict() for p in points])
+
+
+@app.route("/api/trajectories/<int:task_id>/deviation", methods=["GET"])
+def get_trajectory_deviation(task_id):
+    task = Task.query.get(task_id)
+    if not task:
+        return _error("任务不存在", 404)
+    points = TrackPoint.query.filter_by(task_id=task_id).order_by(TrackPoint.timestamp.asc()).all()
+    if not points:
+        return jsonify({"task_id": task_id, "total_points": 0, "deviation_points": 0, "deviation_rate": 0.0, "route_anomaly": False, "points_detail": []})
+    net = NetworkData.query.first()
+    planned_coords = []
+    if net:
+        nodes = json.loads(net.nodes_json) if net.nodes_json else {}
+        route_result = plan_route(
+            list(nodes.keys())[0] if nodes else "S1",
+            task.target_nodes.split(",") if task.target_nodes else [],
+            task.target_links.split(",") if task.target_links else [],
+        )
+        if "route" in route_result:
+            for nid in route_result["route"]:
+                nd = nodes.get(nid, {})
+                if isinstance(nd, dict) and "x" in nd and "y" in nd:
+                    planned_coords.append((nd.get("x", 0), nd.get("y", 0)))
+    deviation_threshold = 50
+    points_detail = []
+    deviation_count = 0
+    for pt in points:
+        min_dist = float("inf")
+        if planned_coords:
+            for i in range(len(planned_coords) - 1):
+                lat1, lon1 = planned_coords[i]
+                lat2, lon2 = planned_coords[i + 1]
+                d = _point_to_segment_distance(pt.gps_lat, pt.gps_lon, lat1, lon1, lat2, lon2)
+                if d < min_dist:
+                    min_dist = d
+            for pc in planned_coords:
+                d = _haversine(pt.gps_lat, pt.gps_lon, pc[0], pc[1])
+                if d < min_dist:
+                    min_dist = d
+        else:
+            min_dist = 0
+        is_deviation = min_dist > deviation_threshold
+        if is_deviation:
+            deviation_count += 1
+        points_detail.append({
+            "id": pt.id,
+            "gps_lat": pt.gps_lat,
+            "gps_lon": pt.gps_lon,
+            "timestamp": pt.timestamp.isoformat() if pt.timestamp else None,
+            "distance_to_route": round(min_dist, 2),
+            "is_deviation": is_deviation,
+        })
+    total = len(points)
+    deviation_rate = round(deviation_count / total * 100, 2) if total > 0 else 0.0
+    route_anomaly = deviation_rate > 20
+    return jsonify({
+        "task_id": task_id,
+        "total_points": total,
+        "deviation_points": deviation_count,
+        "deviation_rate": deviation_rate,
+        "deviation_threshold": deviation_threshold,
+        "route_anomaly": route_anomaly,
+        "points_detail": points_detail,
+    })
+
+
+@app.route("/api/trajectories/planned-route/<int:task_id>", methods=["GET"])
+def get_planned_route_coords(task_id):
+    task = Task.query.get(task_id)
+    if not task:
+        return _error("任务不存在", 404)
+    net = NetworkData.query.first()
+    if not net:
+        return jsonify({"route": [], "coords": []})
+    nodes = json.loads(net.nodes_json) if net.nodes_json else {}
+    start = list(nodes.keys())[0] if nodes else "S1"
+    target_nodes = task.target_nodes.split(",") if task.target_nodes else []
+    target_links = task.target_links.split(",") if task.target_links else []
+    target_nodes = [n for n in target_nodes if n]
+    target_links = [l for l in target_links if l]
+    route_result = plan_route(start, target_nodes, target_links)
+    route = route_result.get("route", [])
+    coords = []
+    for nid in route:
+        nd = nodes.get(nid, {})
+        if isinstance(nd, dict):
+            coords.append({"node_id": nid, "x": nd.get("x", 0), "y": nd.get("y", 0)})
+    return jsonify({"route": route, "coords": coords})
+
+
+# ============================================================
+# Inspection Report Generation
+# ============================================================
+
+@app.route("/api/reports/generate", methods=["GET"])
+def generate_report():
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    if not start_date or not end_date:
+        return _error("start_date和end_date参数为必填项")
+    tasks_in_range = Task.query.filter(
+        Task.scheduled_date >= start_date,
+        Task.scheduled_date <= end_date,
+    ).all()
+    total_tasks = len(tasks_in_range)
+    completed_tasks = len([t for t in tasks_in_range if t.status == Task.STATUS_COMPLETED])
+    anomaly_tasks = len([t for t in tasks_in_range if t.status == Task.STATUS_ANOMALY])
+    completion_rate = round(completed_tasks / total_tasks * 100, 2) if total_tasks > 0 else 0.0
+    overview = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_tasks": total_tasks,
+        "completed_tasks": completed_tasks,
+        "anomaly_tasks": anomaly_tasks,
+        "completion_rate": completion_rate,
+    }
+    inspector_ids = set(t.inspector_id for t in tasks_in_range if t.inspector_id)
+    inspector_workload = []
+    for iid in inspector_ids:
+        insp = Inspector.query.get(iid)
+        if not insp:
+            continue
+        insp_tasks = [t for t in tasks_in_range if t.inspector_id == iid]
+        insp_completed = len([t for t in insp_tasks if t.status == Task.STATUS_COMPLETED])
+        insp_anomalies = Anomaly.query.filter(
+            Anomaly.reporter_id == iid,
+            db.func.date(Anomaly.report_time) >= start_date,
+            db.func.date(Anomaly.report_time) <= end_date,
+        ).count()
+        total_minutes = sum(t.estimated_minutes for t in insp_tasks)
+        avg_minutes = round(total_minutes / insp_completed, 2) if insp_completed > 0 else 0
+        inspector_workload.append({
+            "inspector_id": iid,
+            "inspector_name": insp.name,
+            "completed_tasks": insp_completed,
+            "found_anomalies": insp_anomalies,
+            "total_inspection_minutes": total_minutes,
+            "avg_minutes_per_task": avg_minutes,
+        })
+    anomalies_in_range = Anomaly.query.filter(
+        db.func.date(Anomaly.report_time) >= start_date,
+        db.func.date(Anomaly.report_time) <= end_date,
+    ).all()
+    by_type = {}
+    for a in anomalies_in_range:
+        by_type[a.anomaly_type] = by_type.get(a.anomaly_type, 0) + 1
+    by_severity = {}
+    for a in anomalies_in_range:
+        by_severity[a.severity] = by_severity.get(a.severity, 0) + 1
+    by_area = {}
+    for a in anomalies_in_range:
+        area = "未知"
+        if a.task_id:
+            t = Task.query.get(a.task_id)
+            if t and t.area:
+                area = t.area
+        by_area[area] = by_area.get(area, 0) + 1
+    anomaly_stats = {
+        "by_type": by_type,
+        "by_severity": by_severity,
+        "by_area": by_area,
+    }
+    trajectory_compliance = []
+    route_anomaly_tasks = []
+    for t in tasks_in_range:
+        if t.status not in [Task.STATUS_COMPLETED, Task.STATUS_ANOMALY]:
+            continue
+        pt_count = TrackPoint.query.filter_by(task_id=t.id).count()
+        if pt_count == 0:
+            continue
+        dev_result = get_trajectory_deviation(t.id)
+        dev_data = dev_result[0].get_json() if isinstance(dev_result, tuple) else dev_result.get_json()
+        entry = {
+            "task_id": t.id,
+            "task_type": t.task_type,
+            "inspector_name": t.inspector.name if t.inspector else None,
+            "deviation_rate": dev_data.get("deviation_rate", 0),
+            "route_anomaly": dev_data.get("route_anomaly", False),
+        }
+        trajectory_compliance.append(entry)
+        if dev_data.get("route_anomaly", False):
+            route_anomaly_tasks.append(entry)
+    return jsonify({
+        "overview": overview,
+        "inspector_workload": inspector_workload,
+        "anomaly_stats": anomaly_stats,
+        "trajectory_compliance": trajectory_compliance,
+        "route_anomaly_tasks": route_anomaly_tasks,
+    })
+
+
+# ============================================================
+# Alert Rules & Records
+# ============================================================
+
+@app.route("/api/alert-rules", methods=["GET"])
+def list_alert_rules():
+    rules = AlertRule.query.order_by(AlertRule.created_at.desc()).all()
+    return jsonify([r.to_dict() for r in rules])
+
+
+@app.route("/api/alert-rules", methods=["POST"])
+def create_alert_rule():
+    data = request.get_json()
+    if not data:
+        return _error("请求体不能为空")
+    name = data.get("name")
+    condition_json = data.get("condition_json")
+    if not name:
+        return _error("规则名称为必填项")
+    if not condition_json:
+        return _error("触发条件为必填项")
+    level = data.get("level", AlertRule.LEVEL_INFO)
+    valid_levels = [AlertRule.LEVEL_INFO, AlertRule.LEVEL_WARNING, AlertRule.LEVEL_CRITICAL]
+    if level not in valid_levels:
+        return _error(f"告警级别必须是 {valid_levels} 之一")
+    rule = AlertRule(
+        name=name,
+        condition_json=json.dumps(condition_json, ensure_ascii=False) if isinstance(condition_json, dict) else str(condition_json),
+        level=level,
+        notify_method=data.get("notify_method", "site_message"),
+        enabled=data.get("enabled", True),
+    )
+    db.session.add(rule)
+    db.session.commit()
+    return jsonify(rule.to_dict()), 201
+
+
+@app.route("/api/alert-rules/<int:rule_id>", methods=["PUT"])
+def update_alert_rule(rule_id):
+    rule = AlertRule.query.get(rule_id)
+    if not rule:
+        return _error("告警规则不存在", 404)
+    data = request.get_json()
+    if not data:
+        return _error("请求体不能为空")
+    if "name" in data:
+        rule.name = data["name"]
+    if "condition_json" in data:
+        cj = data["condition_json"]
+        rule.condition_json = json.dumps(cj, ensure_ascii=False) if isinstance(cj, dict) else str(cj)
+    if "level" in data:
+        valid = [AlertRule.LEVEL_INFO, AlertRule.LEVEL_WARNING, AlertRule.LEVEL_CRITICAL]
+        if data["level"] not in valid:
+            return _error(f"告警级别必须是 {valid} 之一")
+        rule.level = data["level"]
+    if "notify_method" in data:
+        rule.notify_method = data["notify_method"]
+    if "enabled" in data:
+        rule.enabled = data["enabled"]
+    db.session.commit()
+    return jsonify(rule.to_dict())
+
+
+@app.route("/api/alert-rules/<int:rule_id>", methods=["DELETE"])
+def delete_alert_rule(rule_id):
+    rule = AlertRule.query.get(rule_id)
+    if not rule:
+        return _error("告警规则不存在", 404)
+    AlertRecord.query.filter_by(rule_id=rule_id).delete()
+    db.session.delete(rule)
+    db.session.commit()
+    return jsonify({"message": "删除成功"})
+
+
+@app.route("/api/alerts/check", methods=["POST"])
+def execute_alert_check():
+    rules = AlertRule.query.filter_by(enabled=True).all()
+    now = datetime.utcnow()
+    generated = []
+    for rule in rules:
+        try:
+            cond = json.loads(rule.condition_json) if isinstance(rule.condition_json, str) else rule.condition_json
+        except (json.JSONDecodeError, TypeError):
+            continue
+        rule_type = cond.get("type")
+        triggered = False
+        content = ""
+        if rule_type == "area_consecutive_anomaly":
+            area = cond.get("area", "")
+            days = cond.get("days", 3)
+            threshold = cond.get("threshold", 5)
+            for d in range(days):
+                check_date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
+                count = 0
+                anomalies_day = Anomaly.query.filter(
+                    db.func.date(Anomaly.report_time) == check_date
+                ).all()
+                for a in anomalies_day:
+                    if a.task_id:
+                        t = Task.query.get(a.task_id)
+                        if t and t.area == area:
+                            count += 1
+                if count <= threshold:
+                    break
+            else:
+                triggered = True
+                content = f"片区 {area} 连续 {days} 天异常数超过 {threshold}"
+        elif rule_type == "inspector_overtime":
+            hours_limit = cond.get("hours", 10)
+            today_str = now.strftime("%Y-%m-%d")
+            inspectors = Inspector.query.filter_by(status=Inspector.STATUS_ON_DUTY).all()
+            for insp in inspectors:
+                today_tasks = Task.query.filter(
+                    Task.inspector_id == insp.id,
+                    Task.scheduled_date == today_str,
+                ).all()
+                total_min = sum(t.estimated_minutes for t in today_tasks)
+                if total_min > hours_limit * 60:
+                    triggered = True
+                    content = f"巡检员 {insp.name} 当日工作时长超过 {hours_limit} 小时(当前: {round(total_min/60, 1)}小时)"
+                    break
+        elif rule_type == "urgent_unhandled":
+            hours_limit = cond.get("hours", 2)
+            cutoff = now - timedelta(hours=hours_limit)
+            urgent_unhandled = Anomaly.query.filter(
+                Anomaly.severity == Anomaly.SEVERITY_URGENT,
+                Anomaly.status == Anomaly.STATUS_UNHANDLED,
+                Anomaly.report_time <= cutoff,
+            ).first()
+            if urgent_unhandled:
+                triggered = True
+                content = f"紧急异常 #{urgent_unhandled.id} 未处理已超过 {hours_limit} 小时"
+        if triggered:
+            record = AlertRecord(
+                rule_id=rule.id,
+                alert_time=now,
+                content=content,
+                level=rule.level,
+                status=AlertRecord.STATUS_UNREAD,
+            )
+            db.session.add(record)
+            generated.append(record.to_dict())
+    db.session.commit()
+    return jsonify({"generated_count": len(generated), "alerts": generated})
+
+
+@app.route("/api/alerts/records", methods=["GET"])
+def list_alert_records():
+    query = AlertRecord.query
+    status = request.args.get("status")
+    level = request.args.get("level")
+    if status:
+        query = query.filter(AlertRecord.status == status)
+    if level:
+        query = query.filter(AlertRecord.level == level)
+    records = query.order_by(AlertRecord.alert_time.desc()).all()
+    return jsonify([r.to_dict() for r in records])
+
+
+@app.route("/api/alerts/records/<int:record_id>/read", methods=["PUT"])
+def mark_alert_read(record_id):
+    record = AlertRecord.query.get(record_id)
+    if not record:
+        return _error("告警记录不存在", 404)
+    record.status = AlertRecord.STATUS_READ
+    db.session.commit()
+    return jsonify(record.to_dict())
+
+
+# ============================================================
+# Certificates & Training Records
+# ============================================================
+
+@app.route("/api/certificates", methods=["GET"])
+def list_certificates():
+    insp_id = request.args.get("inspector_id")
+    query = Certificate.query
+    if insp_id:
+        query = query.filter_by(inspector_id=insp_id)
+    certs = query.order_by(Certificate.valid_until.asc()).all()
+    return jsonify([c.to_dict() for c in certs])
+
+
+@app.route("/api/certificates", methods=["POST"])
+def create_certificate():
+    data = request.get_json()
+    if not data:
+        return _error("请求体不能为空")
+    insp_id = data.get("inspector_id")
+    cert_name = data.get("cert_name")
+    valid_until = data.get("valid_until")
+    if not insp_id or not cert_name or not valid_until:
+        return _error("巡检员ID、证书名称、有效期为必填项")
+    insp = Inspector.query.get(insp_id)
+    if not insp:
+        return _error("巡检员不存在", 404)
+    cert = Certificate(
+        inspector_id=insp_id,
+        cert_name=cert_name,
+        issuer=data.get("issuer", ""),
+        valid_until=valid_until,
+    )
+    db.session.add(cert)
+    db.session.commit()
+    _check_and_downgrade(insp_id)
+    return jsonify(cert.to_dict()), 201
+
+
+@app.route("/api/certificates/<int:cert_id>", methods=["DELETE"])
+def delete_certificate(cert_id):
+    cert = Certificate.query.get(cert_id)
+    if not cert:
+        return _error("证书不存在", 404)
+    insp_id = cert.inspector_id
+    db.session.delete(cert)
+    db.session.commit()
+    _check_and_downgrade(insp_id)
+    return jsonify({"message": "删除成功"})
+
+
+@app.route("/api/training-records", methods=["GET"])
+def list_training_records():
+    insp_id = request.args.get("inspector_id")
+    query = TrainingRecord.query
+    if insp_id:
+        query = query.filter_by(inspector_id=int(insp_id))
+    records = query.order_by(TrainingRecord.training_date.desc()).all()
+    return jsonify([r.to_dict() for r in records])
+
+
+@app.route("/api/training-records", methods=["POST"])
+def create_training_record():
+    data = request.get_json()
+    if not data:
+        return _error("请求体不能为空")
+    insp_id = data.get("inspector_id")
+    training_name = data.get("training_name")
+    training_date = data.get("training_date")
+    if not insp_id or not training_name or not training_date:
+        return _error("巡检员ID、培训名称、培训日期为必填项")
+    insp = Inspector.query.get(insp_id)
+    if not insp:
+        return _error("巡检员不存在", 404)
+    result_val = data.get("result", TrainingRecord.RESULT_FAIL)
+    if result_val not in [TrainingRecord.RESULT_PASS, TrainingRecord.RESULT_FAIL]:
+        return _error("考核结果必须是 pass 或 fail")
+    record = TrainingRecord(
+        inspector_id=insp_id,
+        training_name=training_name,
+        training_date=training_date,
+        duration_hours=data.get("duration_hours", 0.0),
+        result=result_val,
+    )
+    db.session.add(record)
+    db.session.commit()
+    return jsonify(record.to_dict()), 201
+
+
+def _check_and_downgrade(inspector_id):
+    insp = Inspector.query.get(inspector_id)
+    if not insp:
+        return
+    certs = Certificate.query.filter_by(inspector_id=inspector_id).all()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    has_expired = any(c.valid_until < today_str for c in certs)
+    if has_expired:
+        if insp.skill_level == Inspector.SKILL_SENIOR:
+            insp.skill_level = Inspector.SKILL_INTERMEDIATE
+        elif insp.skill_level == Inspector.SKILL_INTERMEDIATE:
+            insp.skill_level = Inspector.SKILL_JUNIOR
+    db.session.commit()
+
+
+@app.route("/api/inspectors/<int:insp_id>/cert-status", methods=["GET"])
+def get_inspector_cert_status(insp_id):
+    insp = Inspector.query.get(insp_id)
+    if not insp:
+        return _error("巡检员不存在", 404)
+    certs = Certificate.query.filter_by(inspector_id=insp_id).all()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    soon_str = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    cert_status_list = []
+    for c in certs:
+        status = "valid"
+        if c.valid_until < today_str:
+            status = "expired"
+        elif c.valid_until < soon_str:
+            status = "expiring_soon"
+        cert_status_list.append({
+            "id": c.id,
+            "cert_name": c.cert_name,
+            "issuer": c.issuer,
+            "valid_until": c.valid_until,
+            "status": status,
+        })
+    return jsonify({
+        "inspector_id": insp_id,
+        "skill_level": insp.skill_level,
+        "certificates": cert_status_list,
+    })
+
+
 # ============================================================
 # Init DB & seed data
 # ============================================================
@@ -834,6 +1395,38 @@ def init_db_and_seed():
             links_json=json.dumps(demo_links, ensure_ascii=False),
         )
         db.session.add(net)
+    if AlertRule.query.count() == 0:
+        seed_rules = [
+            AlertRule(name="DMA-1片区连续异常告警",
+                      condition_json=json.dumps({"type": "area_consecutive_anomaly", "area": "DMA-1", "days": 3, "threshold": 5}, ensure_ascii=False),
+                      level=AlertRule.LEVEL_WARNING, notify_method="site_message", enabled=True),
+            AlertRule(name="巡检员超时工作告警",
+                      condition_json=json.dumps({"type": "inspector_overtime", "hours": 10}, ensure_ascii=False),
+                      level=AlertRule.LEVEL_WARNING, notify_method="site_message", enabled=True),
+            AlertRule(name="紧急异常未处理告警",
+                      condition_json=json.dumps({"type": "urgent_unhandled", "hours": 2}, ensure_ascii=False),
+                      level=AlertRule.LEVEL_CRITICAL, notify_method="site_message", enabled=True),
+        ]
+        db.session.add_all(seed_rules)
+    if Certificate.query.count() == 0:
+        seed_certs = [
+            Certificate(inspector_id=1, cert_name="高级管网巡检资格证", issuer="国家水务协会", valid_until="2027-06-01"),
+            Certificate(inspector_id=2, cert_name="中级管网巡检资格证", issuer="省水利厅", valid_until="2025-05-01"),
+            Certificate(inspector_id=3, cert_name="初级管网巡检资格证", issuer="市水务局", valid_until="2026-12-31"),
+            Certificate(inspector_id=4, cert_name="高级管网巡检资格证", issuer="国家水务协会", valid_until="2027-03-15"),
+            Certificate(inspector_id=5, cert_name="中级管网巡检资格证", issuer="省水利厅", valid_until="2025-08-20"),
+        ]
+        db.session.add_all(seed_certs)
+    if TrainingRecord.query.count() == 0:
+        seed_trainings = [
+            TrainingRecord(inspector_id=1, training_name="管网漏损检测技术培训", training_date="2025-01-15", duration_hours=8.0, result="pass"),
+            TrainingRecord(inspector_id=2, training_name="阀门维护操作规程培训", training_date="2025-02-20", duration_hours=4.0, result="pass"),
+            TrainingRecord(inspector_id=3, training_name="水质取样规范培训", training_date="2025-03-10", duration_hours=3.0, result="pass"),
+            TrainingRecord(inspector_id=3, training_name="管网漏损检测技术培训", training_date="2025-04-05", duration_hours=8.0, result="fail"),
+            TrainingRecord(inspector_id=4, training_name="应急抢修技术培训", training_date="2025-01-28", duration_hours=12.0, result="pass"),
+            TrainingRecord(inspector_id=5, training_name="阀门维护操作规程培训", training_date="2025-03-15", duration_hours=4.0, result="pass"),
+        ]
+        db.session.add_all(seed_trainings)
     db.session.commit()
 
 
