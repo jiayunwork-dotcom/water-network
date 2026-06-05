@@ -71,6 +71,8 @@ def init_session_state():
         st.session_state.dma_zone_defs = {}
     if "connectivity_result" not in st.session_state:
         st.session_state.connectivity_result = None
+    if "drag_selected_node" not in st.session_state:
+        st.session_state.drag_selected_node = None
 
 
 def save_undo_state():
@@ -159,7 +161,7 @@ def create_demo_network():
 def draw_network_plotly(network, color_by="none", highlight_leaks=None,
                         eps_hour_data=None, leak_locate_result=None,
                         connectivity_result=None, show_dma_zones=False,
-                        show_dma_boundary=False):
+                        show_dma_boundary=False, selected_node=None):
     fig = go.Figure()
 
     if show_dma_zones and st.session_state.get("dma_zone_defs"):
@@ -392,6 +394,16 @@ def draw_network_plotly(network, color_by="none", highlight_leaks=None,
         showlegend=False,
     ))
 
+    if selected_node and selected_node in network.nodes:
+        sel_n = network.nodes[selected_node]
+        fig.add_trace(go.Scatter(
+            x=[sel_n.x], y=[sel_n.y],
+            mode="markers",
+            marker=dict(size=28, color="rgba(0,0,0,0)", line=dict(width=3, color="#FF4444")),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
     fig.update_layout(
         plot_bgcolor="white",
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
@@ -472,28 +484,133 @@ def page_network_definition():
                 st.error(f"导入失败: {str(e)}")
 
     st.subheader("节点拖拽移动")
-    with st.expander("✥ 拖拽节点", expanded=False):
+
+    drag_mode = st.toggle("🖱️ 拖拽模式", value=False, key="drag_mode_toggle")
+
+    if drag_mode:
         node_ids = list(network.nodes.keys())
-        if node_ids:
-            move_node = st.selectbox("选择节点", node_ids, key="move_node_sel")
-            if move_node and move_node in network.nodes:
-                node = network.nodes[move_node]
+        if not node_ids:
+            st.info("暂无节点可移动")
+        else:
+            st.info("💡 点击画布上的节点选中，然后拖动滑块实时调整位置")
+
+            drag_color_by = st.selectbox("着色方式", ["none", "pressure", "flow", "velocity"],
+                                         format_func=lambda x: {"none": "默认",
+                                                                "pressure": "按水压",
+                                                                "flow": "按流量",
+                                                                "velocity": "按流速"}.get(x, x),
+                                         key="drag_color_by")
+
+            selected_drag_node = st.session_state.get("drag_selected_node")
+            if selected_drag_node and selected_drag_node not in network.nodes:
+                st.session_state.drag_selected_node = None
+                selected_drag_node = None
+
+            drag_fig = draw_network_plotly(
+                network, color_by=drag_color_by,
+                selected_node=selected_drag_node,
+            )
+            drag_fig.update_layout(
+                clickmode="event+select",
+                dragmode="select",
+            )
+            event = st.plotly_chart(drag_fig, on_select="rerun", key="drag_chart")
+
+            clicked_node = None
+            if event and event.selection and event.selection.get("points"):
+                pt = event.selection["points"][0]
+                clicked_text = pt.get("text", "")
+                if clicked_text and clicked_text in network.nodes:
+                    clicked_node = clicked_text
+
+            if clicked_node and clicked_node != selected_drag_node:
+                save_undo_state()
+                st.session_state.drag_selected_node = clicked_node
+                st.rerun()
+
+            if selected_drag_node and selected_drag_node in network.nodes:
+                node = network.nodes[selected_drag_node]
+                st.markdown(f"**已选中节点: {selected_drag_node}**")
+
+                all_x = [n.x for n in network.nodes.values()]
+                all_y = [n.y for n in network.nodes.values()]
+                x_min = min(all_x) - 200 if all_x else 0
+                x_max = max(all_x) + 200 if all_x else 1000
+                y_min = min(all_y) - 200 if all_y else 0
+                y_max = max(all_y) + 200 if all_y else 1000
+
+                if "drag_original_pos" not in st.session_state:
+                    st.session_state.drag_original_pos = None
+                if st.session_state.drag_original_pos is None:
+                    st.session_state.drag_original_pos = (node.x, node.y)
+
                 col1, col2 = st.columns(2)
                 with col1:
-                    new_x = st.number_input("X坐标", value=float(node.x),
-                                            step=10.0, key="move_x")
+                    new_x = st.slider(
+                        "X坐标", min_value=float(x_min), max_value=float(x_max),
+                        value=float(node.x), step=5.0, key="drag_x",
+                    )
                 with col2:
-                    new_y = st.number_input("Y坐标", value=float(node.y),
-                                            step=10.0, key="move_y")
-                if st.button("✅ 移动节点", key="btn_move_node"):
-                    save_undo_state()
+                    new_y = st.slider(
+                        "Y坐标", min_value=float(y_min), max_value=float(y_max),
+                        value=float(node.y), step=5.0, key="drag_y",
+                    )
+
+                if abs(new_x - node.x) > 0.01 or abs(new_y - node.y) > 0.01:
                     node.x = new_x
                     node.y = new_y
                     st.session_state.hydraulic_results = None
-                    st.success(f"节点 {move_node} 已移动到 ({new_x}, {new_y})")
                     st.rerun()
-        else:
-            st.info("暂无节点可移动")
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("✅ 确认位置", key="btn_confirm_drag"):
+                        orig = st.session_state.drag_original_pos
+                        if orig and (abs(node.x - orig[0]) > 0.01 or abs(node.y - orig[1]) > 0.01):
+                            old_x, old_y = node.x, node.y
+                            node.x = orig[0]
+                            node.y = orig[1]
+                            save_undo_state()
+                            node.x = old_x
+                            node.y = old_y
+                        st.session_state.drag_selected_node = None
+                        st.session_state.drag_original_pos = None
+                        st.success(f"节点 {selected_drag_node} 位置已确认: ({node.x:.1f}, {node.y:.1f})")
+                        st.rerun()
+                with col_b:
+                    if st.button("❌ 取消选择", key="btn_cancel_drag"):
+                        orig = st.session_state.drag_original_pos
+                        if orig:
+                            node.x = orig[0]
+                            node.y = orig[1]
+                        st.session_state.drag_selected_node = None
+                        st.session_state.drag_original_pos = None
+                        st.rerun()
+            else:
+                st.info("👆 请点击画布上的节点来选中它")
+    else:
+        with st.expander("✥ 手动输入坐标移动节点", expanded=False):
+            node_ids = list(network.nodes.keys())
+            if node_ids:
+                move_node = st.selectbox("选择节点", node_ids, key="move_node_sel")
+                if move_node and move_node in network.nodes:
+                    node = network.nodes[move_node]
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        new_x = st.number_input("X坐标", value=float(node.x),
+                                                step=10.0, key="move_x")
+                    with col2:
+                        new_y = st.number_input("Y坐标", value=float(node.y),
+                                                step=10.0, key="move_y")
+                    if st.button("✅ 移动节点", key="btn_move_node"):
+                        save_undo_state()
+                        node.x = new_x
+                        node.y = new_y
+                        st.session_state.hydraulic_results = None
+                        st.success(f"节点 {move_node} 已移动到 ({new_x}, {new_y})")
+                        st.rerun()
+            else:
+                st.info("暂无节点可移动")
 
     st.subheader("管段分割")
     with st.expander("✂️ 分割管段", expanded=False):
@@ -512,10 +629,10 @@ def page_network_definition():
                     st.info(f"将在中点 ({mid_x:.1f}, {mid_y:.1f}) 插入新节点")
                     if st.button("✂️ 确认分割", key="btn_split"):
                         save_undo_state()
-                        new_node_id = f"SPLIT_{split_link_id}"
+                        new_node_id = f"N{split_link_id}"
                         idx = 1
                         while new_node_id in network.nodes:
-                            new_node_id = f"SPLIT_{split_link_id}_{idx}"
+                            new_node_id = f"N{split_link_id}{idx}"
                             idx += 1
                         new_node = Node(
                             id=new_node_id,
@@ -526,13 +643,20 @@ def page_network_definition():
                         )
                         network.add_node(new_node)
 
-                        new_link_id_1 = f"{split_link_id}a"
-                        new_link_id_2 = f"{split_link_id}b"
-                        idx2 = 1
-                        while new_link_id_1 in network.links:
-                            new_link_id_1 = f"{split_link_id}a_{idx2}"
-                            new_link_id_2 = f"{split_link_id}b_{idx2}"
-                            idx2 += 1
+                        def _next_link_ids(n=2, prefix="P"):
+                            max_num = 0
+                            for lid in network.links:
+                                if lid.startswith(prefix):
+                                    suffix = lid[len(prefix):]
+                                    try:
+                                        num = int(suffix)
+                                        if num > max_num:
+                                            max_num = num
+                                    except ValueError:
+                                        pass
+                            return [f"{prefix}{max_num + i + 1}" for i in range(n)]
+
+                        new_link_id_1, new_link_id_2 = _next_link_ids(2)
 
                         half_length = link.length / 2
                         new_link_1 = Link(
@@ -1290,33 +1414,42 @@ def page_scenario_comparison():
         st.warning("请先定义管网拓扑")
         return
 
+    if "scenarios" not in st.session_state or st.session_state.scenarios is None:
+        st.session_state.scenarios = {}
+
     st.subheader("工况管理")
 
     with st.expander("💾 保存当前工况", expanded=True):
-        scenario_name = st.text_input("工况名称", value="", key="scenario_name")
+        scenario_name = st.text_input("工况名称", value="", key="scenario_name_input")
         if st.button("保存当前工况", key="save_scenario"):
             if not scenario_name:
                 st.error("请输入工况名称")
             elif scenario_name in st.session_state.scenarios:
                 st.error(f"工况 '{scenario_name}' 已存在，请使用其他名称")
             else:
-                demands = {nid: node.demand for nid, node in network.nodes.items()}
-                valve_settings = {lid: link.setting for lid, link in network.links.items()
-                                  if link.element_type == ElementType.VALVE}
-                st.session_state.scenarios[scenario_name] = {
+                from copy import deepcopy as _deepcopy
+                demands = _deepcopy({nid: node.demand for nid, node in network.nodes.items()})
+                valve_settings = _deepcopy({lid: link.setting for lid, link in network.links.items()
+                                            if link.element_type == ElementType.VALVE})
+                snapshot = {
                     "name": scenario_name,
                     "demands": demands,
                     "valve_settings": valve_settings,
+                    "node_ids": list(network.nodes.keys()),
+                    "link_ids": list(network.links.keys()),
                 }
-                st.success(f"工况 '{scenario_name}' 已保存")
+                scenarios = st.session_state.scenarios.copy()
+                scenarios[scenario_name] = snapshot
+                st.session_state.scenarios = scenarios
+                st.success(f"工况 '{scenario_name}' 已保存（共{len(scenarios)}个工况）")
                 st.rerun()
 
     if st.session_state.scenarios:
         st.markdown("**已保存的工况:**")
         scenario_data = []
         for sname, sdata in st.session_state.scenarios.items():
-            n_nodes = len(sdata["demands"])
-            n_valves = len(sdata["valve_settings"])
+            n_nodes = len(sdata.get("demands", {}))
+            n_valves = len(sdata.get("valve_settings", {}))
             scenario_data.append({
                 "工况名称": sname,
                 "节点数": n_nodes,
@@ -1327,8 +1460,12 @@ def page_scenario_comparison():
         delete_scenario = st.selectbox("删除工况", [""] + list(st.session_state.scenarios.keys()),
                                        key="del_scenario")
         if delete_scenario and st.button("🗑️ 删除选中工况"):
-            del st.session_state.scenarios[delete_scenario]
+            scenarios = st.session_state.scenarios.copy()
+            del scenarios[delete_scenario]
+            st.session_state.scenarios = scenarios
             st.rerun()
+    else:
+        st.info("暂无已保存的工况，请先保存当前工况")
 
     st.subheader("工况对比分析")
 
