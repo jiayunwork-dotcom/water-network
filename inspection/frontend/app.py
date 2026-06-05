@@ -3,9 +3,21 @@ import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import os
 from datetime import datetime
 
-API_BASE = st.secrets.get("API_BASE", "http://localhost:5001")
+
+def _get_api_base():
+    env_val = os.environ.get("API_BASE")
+    if env_val:
+        return env_val
+    try:
+        return st.secrets.get("API_BASE", "http://localhost:5001")
+    except Exception:
+        return "http://localhost:5001"
+
+
+API_BASE = _get_api_base()
 
 
 def api_get(path, params=None):

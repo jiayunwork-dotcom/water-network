@@ -183,20 +183,25 @@ def create_task():
         return _error(f"难度等级必须是 {valid_diff} 之一")
     nodes_list = data.get("target_nodes", [])
     links_list = data.get("target_links", [])
+    insp_id = data.get("inspector_id")
+    initial_status = Task.STATUS_PENDING
+    if insp_id:
+        insp = Inspector.query.get(insp_id)
+        if not insp:
+            return _error(f"巡检员 {insp_id} 不存在")
+        initial_status = Task.STATUS_ASSIGNED
     task = Task(
         task_type=task_type,
         difficulty=difficulty,
         estimated_minutes=data.get("estimated_minutes", 30),
-        status=Task.STATUS_PENDING,
-        inspector_id=data.get("inspector_id"),
+        status=initial_status,
+        inspector_id=insp_id,
         area=data.get("area", ""),
         target_nodes=",".join(nodes_list) if isinstance(nodes_list, list) else "",
         target_links=",".join(links_list) if isinstance(links_list, list) else "",
         description=data.get("description", ""),
         scheduled_date=data.get("scheduled_date", ""),
     )
-    if task.inspector_id:
-        task.status = Task.STATUS_ASSIGNED
     db.session.add(task)
     db.session.commit()
     return jsonify(task.to_dict()), 201
@@ -243,9 +248,18 @@ def update_task(task_id):
     if "scheduled_date" in data:
         task.scheduled_date = data["scheduled_date"]
     if "inspector_id" in data:
-        task.inspector_id = data["inspector_id"]
-        if task.status == Task.STATUS_PENDING and data["inspector_id"]:
-            task.status = Task.STATUS_ASSIGNED
+        new_insp_id = data["inspector_id"]
+        if new_insp_id:
+            insp = Inspector.query.get(new_insp_id)
+            if not insp:
+                return _error(f"巡检员 {new_insp_id} 不存在")
+            task.inspector_id = new_insp_id
+            if task.status == Task.STATUS_PENDING:
+                task.status = Task.STATUS_ASSIGNED
+        else:
+            task.inspector_id = None
+            if task.status in [Task.STATUS_ASSIGNED]:
+                task.status = Task.STATUS_PENDING
     db.session.commit()
     return jsonify(task.to_dict())
 
@@ -280,10 +294,18 @@ def transition_task(task_id):
             f"允许的转换: {valid_transitions}"
         )
     task.status = new_status
-    if new_status == Task.STATUS_ASSIGNED and "inspector_id" in data:
-        task.inspector_id = data["inspector_id"]
+    if new_status == Task.STATUS_ASSIGNED:
+        insp_id = data.get("inspector_id")
+        if not insp_id:
+            return _error("分配任务时必须指定巡检员(inspector_id)")
+        insp = Inspector.query.get(insp_id)
+        if not insp:
+            return _error(f"巡检员 {insp_id} 不存在")
+        task.inspector_id = insp_id
     if new_status == Task.STATUS_IN_PROGRESS and not task.inspector_id:
         return _error("进行中的任务必须指定巡检员")
+    if new_status == Task.STATUS_PENDING:
+        task.inspector_id = None
     db.session.commit()
     return jsonify(task.to_dict())
 
@@ -307,9 +329,14 @@ def schedule_daily():
 
     assignments = result["assignments"]
     for insp_id, tids in assignments.items():
+        if not insp_id:
+            continue
+        insp = Inspector.query.get(insp_id)
+        if not insp:
+            continue
         for tid in tids:
             task = Task.query.get(tid)
-            if task:
+            if task and task.status == Task.STATUS_PENDING:
                 task.inspector_id = insp_id
                 task.status = Task.STATUS_ASSIGNED
     db.session.commit()
@@ -455,25 +482,22 @@ def create_anomaly():
     db.session.flush()
 
     if severity == Anomaly.SEVERITY_URGENT:
+        senior = Inspector.query.filter_by(
+            skill_level=Inspector.SKILL_SENIOR,
+            status=Inspector.STATUS_ON_DUTY,
+        ).first()
         auto_task = Task(
             task_type=Task.TYPE_LEAK,
             difficulty=Task.DIFFICULTY_HARD,
             estimated_minutes=120,
-            status=Task.STATUS_ASSIGNED,
+            status=Task.STATUS_ASSIGNED if senior else Task.STATUS_PENDING,
+            inspector_id=senior.id if senior else None,
             area="",
             target_nodes=data.get("related_node", ""),
             target_links=data.get("related_link", ""),
             description=f"紧急异常自动生成: {anomaly_type}",
             scheduled_date=datetime.now().strftime("%Y-%m-%d"),
         )
-        senior = Inspector.query.filter_by(
-            skill_level=Inspector.SKILL_SENIOR,
-            status=Inspector.STATUS_ON_DUTY,
-        ).first()
-        if senior:
-            auto_task.inspector_id = senior.id
-        else:
-            auto_task.status = Task.STATUS_PENDING
         db.session.add(auto_task)
         db.session.flush()
         anomaly.auto_task_id = auto_task.id
